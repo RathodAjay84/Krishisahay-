@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+chat_history.json
+__pycache__/
+*.py[cod]
+.venv/
+*.crdownload
