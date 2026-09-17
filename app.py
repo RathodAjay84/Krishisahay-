@@ -5,11 +5,13 @@ import streamlit as st
 from dotenv import load_dotenv
 import PIL.Image
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
 
-load_dotenv()
+ENV_FILE = Path(__file__).with_name(".env")
+load_dotenv(dotenv_path=ENV_FILE)
 
 # core business logic modules
 from crop_model import recommend_crop
@@ -18,13 +20,13 @@ from fertilizer_model import recommend_fertilizer
 from weather import fetch_weather, advice_from_weather
 from market_price import get_current_price, predict_price_trend, available_crops, get_price_chart
 from utils import t, load_css
-from chat_service import bubble_html, generate_response, record_chat_message, timestamp, transcribe_audio
+from chat_service import bubble_html, generate_response, get_time_greeting, record_chat_message, timestamp, transcribe_audio
 
 # --- UI components --------------------------------------------------------------
 
 def show_dashboard(lang):
     st.markdown('<div class="section-kicker">Field operations / Telangana</div>', unsafe_allow_html=True)
-    st.header("Good evening, farmer", icon=":material/dashboard:")
+    st.header(f"{get_time_greeting()}, farmer", icon=":material/dashboard:")
     st.caption("A live snapshot of your growing conditions, crop health, and farm priorities.")
 
     weather = fetch_weather()
@@ -122,6 +124,7 @@ def show_disease_detection(lang):
             with st.spinner("Analyzing..."):
                 try:
                     result = predict_disease(img)
+                    st.session_state.crop_health_context = result
                     is_healthy = "healthy" in result["disease"].lower()
                     result_class = "health-good" if is_healthy else "health-risk"
                     st.markdown(
@@ -254,18 +257,34 @@ def show_schemes(lang):
 
 def show_chat(lang):
     st.header("AI farming assistant", icon=":material/chat:")
-    st.caption("Ask in English, Hindi, or Telugu. Type a question or use the microphone in the chat box.")
+    st.caption(f"{get_time_greeting()}, farmer. Ask in English, Hindi, or Telugu. Add field readings for more precise advice.")
 
-    if st.session_state.get("chat_schema_version") != 2:
-        st.session_state.chat_schema_version = 2
+    if st.session_state.get("chat_schema_version") != 7:
+        st.session_state.chat_schema_version = 7
         st.session_state.messages = []
 
     if not st.session_state.get("messages"):
         st.session_state.messages = [{
             "role": "assistant",
-            "content": "Namaste! I am KrishiSahay, your Telangana farming assistant.\n\nI can help with crop planning, pests, disease, fertilizer, weather, schemes, and market prices.",
+            "content": "Namaste! I’m KrishiSahay. Tell me your crop, location, symptoms, and any soil or sensor readings. I’ll connect the details and explain the next practical step.",
             "timestamp": timestamp(),
         }]
+
+    with st.expander("Add field context", expanded=False):
+        first, second, third = st.columns(3)
+        with first:
+            crop = st.text_input("Crop", placeholder="Example: cotton")
+            soil_moisture = st.number_input("Soil moisture (%)", 0.0, 100.0, 0.0, 1.0)
+            temperature = st.number_input("Temperature (°C)", 0.0, 60.0, 0.0, 1.0)
+        with second:
+            humidity = st.number_input("Humidity (%)", 0.0, 100.0, 0.0, 1.0)
+            ph = st.number_input("Soil pH", 0.0, 14.0, 0.0, 0.1)
+            nitrogen = st.number_input("Nitrogen (N)", 0.0, 500.0, 0.0, 5.0)
+        with third:
+            phosphorus = st.number_input("Phosphorus (P)", 0.0, 500.0, 0.0, 5.0)
+            potassium = st.number_input("Potassium (K)", 0.0, 500.0, 0.0, 5.0)
+            if st.session_state.get("crop_health_context"):
+                st.caption("Latest crop image analysis will be included.")
 
     st.markdown('<div class="chat-thread">', unsafe_allow_html=True)
     for msg in st.session_state.messages:
@@ -313,7 +332,16 @@ def show_chat(lang):
     record_chat_message("user", prompt)
 
     with st.status("KrishiSahay is preparing a practical answer...", expanded=False) as status:
-        answer = generate_response(prompt, st.session_state.messages[:-1], lang)
+        field_context = {
+            "crop": crop or "Not provided",
+            "soil_moisture": f"{soil_moisture}%" if soil_moisture else "Not provided",
+            "temperature": f"{temperature} °C" if temperature else "Not provided",
+            "humidity": f"{humidity}%" if humidity else "Not provided",
+            "ph": ph or "Not provided",
+            "npk": f"N={nitrogen}, P={phosphorus}, K={potassium}" if any((nitrogen, phosphorus, potassium)) else "Not provided",
+            "image_analysis": st.session_state.get("crop_health_context", "No image analysis available"),
+        }
+        answer = generate_response(prompt, st.session_state.messages[:-1], lang, field_context)
         status.update(label="Answer ready", state="complete")
 
     assistant_message = {"role": "assistant", "content": answer, "timestamp": timestamp()}

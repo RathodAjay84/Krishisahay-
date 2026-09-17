@@ -1,7 +1,6 @@
 streamlit
 Pillow
 requests
-google-generativeai
 python-dotenv
 langchain
 langchain-community

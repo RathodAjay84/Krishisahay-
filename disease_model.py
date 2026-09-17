@@ -7,7 +7,13 @@ would load a custom model trained on leaf images, map its outputs to
 meaningful disease names, and perhaps highlight affected regions.
 """
 
+import base64
+import io
+import json
 import os
+import urllib.error
+import urllib.request
+from pathlib import Path
 from PIL import Image
 
 import torch
@@ -32,14 +38,12 @@ def _initialize():
         ])
 
 
-"""Plant image assessment using a vision-capable Gemini model."""
-
-import os
-
 from dotenv import load_dotenv
 from PIL import Image
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).parent
+ENV_FILE = PROJECT_ROOT / ".env"
+load_dotenv(dotenv_path=ENV_FILE)
 
 
 def _parse_response(text: str) -> dict:
@@ -67,37 +71,52 @@ def _parse_response(text: str) -> dict:
 
 
 def predict_disease(image: Image.Image) -> dict:
-    """Assess a plant image with Gemini Vision when configured.
+    """Assess a plant image with OpenAI vision when configured.
 
     A generic ImageNet classifier cannot identify plant diseases, so this
     function never invents a disease label when the vision service is absent.
     """
-    api_key = os.getenv("GEMINI_API")
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return {
             "disease": "Vision AI is not configured",
-            "treatment": "Add a GEMINI_API key to enable plant disease analysis. Until then, do not spray based on this result; consult a local agriculture officer.",
+            "treatment": "Add an OPENAI_API_KEY to enable plant disease analysis. Until then, do not spray based on this result; consult a local agriculture officer.",
             "observations": "The image was received, but a disease diagnosis requires a plant-trained vision model.",
             "confidence": "Not available",
         }
 
     try:
-        import google.generativeai as genai
-
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.5-flash")
+        image_buffer = io.BytesIO()
+        image.convert("RGB").save(image_buffer, format="JPEG", quality=85)
+        image_data = base64.b64encode(image_buffer.getvalue()).decode("ascii")
         prompt = """You are a cautious agricultural plant pathologist. Analyze this plant leaf image.
 Return exactly three lines:
 Diagnosis: <most likely disease or Healthy; say Uncertain if the image is insufficient>
 Observations: <visible symptoms, affected area, and confidence level>
 Treatment: <safe next steps; do not recommend a chemical unless you mention following the local label>
-Do not claim certainty from a low-quality or non-leaf image."""
-        response = model.generate_content([prompt, image])
-        return _parse_response(response.text)
-    except Exception as error:
+Do not claim certainty from a low-quality or non-leaf image. If unclear, say exactly:
+Image is not clear. Please upload a better image."""
+        payload = json.dumps({
+            "model": os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+            "input": [{"role": "user", "content": [
+                {"type": "input_text", "text": prompt},
+                {"type": "input_image", "image_url": f"data:image/jpeg;base64,{image_data}"},
+            ]}],
+            "temperature": 0.1,
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            "https://api.openai.com/v1/responses",
+            data=payload,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        return _parse_response(result.get("output_text", ""))
+    except (OSError, ValueError, urllib.error.URLError) as error:
         return {
             "disease": "Vision analysis failed",
-            "treatment": "Check your GEMINI_API key and internet connection, then try again. Do not apply chemicals based on an unverified diagnosis.",
+            "treatment": "Check your OPENAI_API_KEY and internet connection, then try again. Do not apply chemicals based on an unverified diagnosis.",
             "observations": str(error),
             "confidence": "Not available",
         }

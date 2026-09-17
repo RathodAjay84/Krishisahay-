@@ -6,19 +6,54 @@ import html
 import io
 import json
 import os
+import re
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
+from knowledge_base import retrieve_context
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).parent
+ENV_FILE = PROJECT_ROOT / ".env"
+load_dotenv(dotenv_path=ENV_FILE)
 
 CHAT_LOG_PATH = Path(__file__).with_name("chat_history.json")
+
+SCHEMES_CONTEXT = """Relevant India-focused support options:
+- PM-KISAN: confirm current eligibility at https://pmkisan.gov.in/
+- PMFBY crop insurance: check enrolment and claim rules at https://pmfby.gov.in/
+- Kisan Credit Card: ask a bank or agriculture office about eligibility.
+- Soil Health Card: https://soilhealth.dac.gov.in/
+- PM Krishi Sinchai Yojana: https://pmksy.gov.in/
+- mKisan advisories: https://mkisan.gov.in/
+Never promise a benefit, amount, subsidy, or approval; schemes and eligibility can change."""
+
+RESPONSE_GUIDANCE = """Answer like a thoughtful agricultural expert, not a form or template.
+Write natural short paragraphs with a conversational flow. Explain what you understood,
+the likely causes and reasoning, immediate actions, prevention, and an extra insight when
+useful. Vary sentence openings and wording; never copy a previous answer. Adapt the
+length to the question and use crop, image, sensor, season, location, and conversation
+context. Say possible or likely when evidence is incomplete. If an image is unclear, say:
+I’m not fully confident from the image. Please upload a clearer photo.
+Never invent a link, image finding, weather value, price, diagnosis, pesticide mixture,
+or unsafe dose. Follow product labels and suggest a local agriculture officer for product
+selection. Include relevant official links from the supplied context when useful."""
 
 
 def timestamp() -> str:
     """Return a short local timestamp for chat messages."""
     return datetime.now().strftime("%d %b %Y, %I:%M %p")
+
+
+def get_time_greeting(now: datetime | None = None) -> str:
+    hour = (now or datetime.now()).hour
+    if hour < 12:
+        return "Good Morning"
+    if hour < 17:
+        return "Good Afternoon"
+    return "Good Evening"
 
 
 def transcribe_audio(audio_file) -> str:
@@ -51,9 +86,21 @@ def record_chat_message(role: str, content: str) -> None:
         return
 
 
-def _offline_answer(prompt: str) -> str:
+def _offline_answer(prompt: str, field_context: dict | None = None) -> str:
     """Provide concise agriculture guidance when Gemini is not configured."""
     question = prompt.lower()
+    context = field_context or {}
+    moisture_text = str(context.get("soil_moisture", ""))
+    try:
+        moisture = float(moisture_text.replace("%", ""))
+    except ValueError:
+        moisture = None
+    if moisture is not None and moisture < 30:
+        return (
+            f"The soil moisture reading is low at about {moisture:g}%. This suggests water stress may be limiting root uptake. "
+            "Check moisture at root depth in two or three places. If the soil is dry and heavy rain is not expected, irrigate slowly during the cooler hours; avoid flooding and recheck the field afterwards. "
+            "Give priority to plants in flowering or fruit filling, repair leaks, and use mulch where suitable. Share the crop and soil type for a more exact schedule."
+        )
     if any(word in question for word in ("hello", "hi", "namaste")):
         return "Namaste! I can help with crops, soil, fertilizer, pests, disease, weather, irrigation, schemes, and market planning."
     if question.strip() in {"what is crop", "what is a crop", "define crop", "crop meaning"}:
@@ -90,46 +137,88 @@ def _clean_response(text: str) -> str:
     return cleaned
 
 
-def generate_response(prompt: str, messages: list[dict], language: str) -> str:
-    """Generate a contextual Gemini answer with a deterministic offline fallback."""
-    api_key = os.getenv("GEMINI_API")
+def _openai_response(instructions: str, user_content: str) -> str:
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        return _offline_answer(prompt)
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+    payload = json.dumps({
+        "model": os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+        "instructions": instructions,
+        "input": user_content,
+        "temperature": 0.7,
+        "top_p": 1,
+        "max_output_tokens": 700,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=payload,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=45) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    answer = result.get("output_text", "").strip()
+    if not answer:
+        raise RuntimeError("OpenAI returned an empty response")
+    return answer
 
+
+def generate_response(prompt: str, messages: list[dict], language: str, field_context: dict | None = None) -> str:
+    """Generate a contextual OpenAI answer with a useful offline fallback."""
+    context = field_context or {}
+    if not os.getenv("OPENAI_API_KEY"):
+        return _offline_answer(prompt, field_context)
     try:
-        import google.generativeai as genai
-
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        recent_history = "\n".join(
+        now = datetime.now()
+        live_context = "\n".join([
+            f"Current date and time: {now.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Greeting: {get_time_greeting(now)}",
+            f"Crop: {context.get('crop', 'Not provided')}",
+            f"Soil moisture: {context.get('soil_moisture', 'Not provided')}",
+            f"Temperature: {context.get('temperature', 'Not provided')}",
+            f"Humidity: {context.get('humidity', 'Not provided')}",
+            f"pH: {context.get('ph', 'Not provided')}",
+            f"NPK: {context.get('npk', 'Not provided')}",
+            f"Crop image analysis: {context.get('image_analysis', 'Not available')}",
+        ])
+        history = "\n".join(
             f"{item.get('role', 'user').title()}: {item.get('content', '')}"
             for item in messages[-8:]
         )
-        instruction = f"""You are KrishiSahay, a careful agricultural assistant for Telangana farmers.
-Answer the latest question in {language}. Use the conversation for context, but do not repeat it.
-Be practical and structured. Use a short heading and bullets when useful.
-Give specific next steps, ask for missing crop/soil/season details, and never invent live weather or prices.
-For pesticide or fertilizer advice, mention label directions and local agriculture guidance.
-If the question is unrelated to farming, politely say you specialize in agriculture.
+        question_lower = prompt.lower()
+        schemes = SCHEMES_CONTEXT if any(word in question_lower for word in ('money', 'loan', 'credit', 'scheme', 'subsid', 'insurance', 'risk', 'fertilizer', 'irrigation')) else ''
+        instruction = f"""You are KrishiSahay GPT, a smart farming assistant for Indian farmers.
+Answer in {language}. {RESPONSE_GUIDANCE}
+
+Real-time field context:
+{live_context}
+
+Retrieved local guidance:
+{retrieve_context(prompt)}
+
+Relevant schemes, if any:
+{schemes or 'None needed for this question.'}
 
 Conversation:
-{recent_history}
+{history}
 
-Latest question: {prompt}
+Latest farmer question:
+{prompt}
 
-Answer:"""
-        response = model.generate_content(instruction)
-        answer = _clean_response(response.text)
-        return answer or _offline_answer(prompt)
-    except Exception:
-        # Keep the user-facing answer useful when the remote provider rejects a
-        # key, reaches a quota, or is temporarily unavailable.
-        return _offline_answer(prompt)
+Write the best direct answer now."""
+        return _clean_response(_openai_response(instruction, prompt))
+    except (OSError, ValueError, urllib.error.URLError, RuntimeError):
+        return _offline_answer(prompt, context)
 
 
 def bubble_html(role: str, content: str, message_time: str) -> str:
     """Build a safe, styled chat bubble for the transcript."""
     safe_content = html.escape(content).replace("\n", "<br>")
+    safe_content = re.sub(
+        r"(https://[^\s<]+)",
+        r'<a href="\1" target="_blank" rel="noopener noreferrer">\1</a>',
+        safe_content,
+    )
     safe_time = html.escape(message_time)
     label = "You" if role == "user" else "KrishiSahay"
     return (
