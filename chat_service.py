@@ -157,7 +157,23 @@ def _openai_response(instructions: str, user_content: str) -> str:
     )
     with urllib.request.urlopen(request, timeout=45) as response:
         result = json.loads(response.read().decode("utf-8"))
+
     answer = result.get("output_text", "").strip()
+    if not answer:
+        chunks = []
+        for item in result.get("output", []) or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "message":
+                for part in item.get("content", []) or []:
+                    if isinstance(part, dict):
+                        text = part.get("text") or part.get("output_text")
+                        if isinstance(text, str) and text.strip():
+                            chunks.append(text.strip())
+            elif item.get("type") == "output_text" and isinstance(item.get("text"), str):
+                chunks.append(item["text"].strip())
+        answer = "\n".join(chunks).strip()
+
     if not answer:
         raise RuntimeError("OpenAI returned an empty response")
     return answer

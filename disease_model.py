@@ -46,6 +46,30 @@ ENV_FILE = PROJECT_ROOT / ".env"
 load_dotenv(dotenv_path=ENV_FILE)
 
 
+def _extract_openai_text(response: dict) -> str:
+    """Read text from both older and newer OpenAI Responses payloads."""
+    text = response.get("output_text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+
+    chunks = []
+    for item in response.get("output", []) or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "message":
+            for part in item.get("content", []) or []:
+                if isinstance(part, dict):
+                    part_text = part.get("text") or part.get("output_text")
+                    if isinstance(part_text, str) and part_text.strip():
+                        chunks.append(part_text.strip())
+        elif item.get("type") == "output_text" and isinstance(item.get("text"), str):
+            chunks.append(item["text"].strip())
+
+    if chunks:
+        return "\n".join(chunks)
+    return ""
+
+
 def _parse_response(text: str) -> dict:
     """Convert the vision response into the fields used by the UI."""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -112,8 +136,55 @@ Image is not clear. Please upload a better image."""
         )
         with urllib.request.urlopen(request, timeout=60) as response:
             result = json.loads(response.read().decode("utf-8"))
-        return _parse_response(result.get("output_text", ""))
-    except (OSError, ValueError, urllib.error.URLError) as error:
+        diagnosis_text = _extract_openai_text(result)
+        if not diagnosis_text:
+            raise RuntimeError("OpenAI returned an empty response")
+        return _parse_response(diagnosis_text)
+    except urllib.error.HTTPError as error:
+        detail = ""
+        try:
+            detail = error.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = str(error)
+
+        parsed_detail = ""
+        try:
+            parsed = json.loads(detail)
+            if isinstance(parsed, dict):
+                err = parsed.get("error", {})
+                if isinstance(err, dict):
+                    parsed_detail = err.get("message", "") or err.get("code", "")
+        except Exception:
+            parsed_detail = ""
+
+        if error.code == 429:
+            if "credit_balance_exhausted" in parsed_detail.lower() or "no credits remaining" in parsed_detail.lower():
+                return {
+                    "disease": "Vision analysis unavailable",
+                    "treatment": "Your OpenAI account has no remaining credits or quota. Add credits to the billing account or use another valid key, then try again. Do not apply chemicals based on an unverified diagnosis.",
+                    "observations": "OpenAI account has no available credits. This is not a confirmed crop diagnosis.",
+                    "confidence": "Not available",
+                }
+            return {
+                "disease": "Vision analysis unavailable",
+                "treatment": "OpenAI request quota or rate limit was reached. Please wait a bit and try again later. Do not apply chemicals based on an unverified diagnosis.",
+                "observations": f"OpenAI rate limit reached: {parsed_detail or detail[:200]}. This is not a confirmed crop diagnosis.",
+                "confidence": "Not available",
+            }
+        if error.code in (401, 403):
+            return {
+                "disease": "Vision analysis failed",
+                "treatment": "Your OPENAI_API_KEY is invalid or not authorized. Fix the key, then retry. Do not apply chemicals based on an unverified diagnosis.",
+                "observations": f"OpenAI rejected the key ({error.code}). {parsed_detail or detail[:200]}",
+                "confidence": "Not available",
+            }
+        return {
+            "disease": "Vision analysis failed",
+            "treatment": "Check your OPENAI_API_KEY and internet connection, then try again. Do not apply chemicals based on an unverified diagnosis.",
+            "observations": f"OpenAI request failed ({error.code}): {parsed_detail or detail[:200] or error.reason}",
+            "confidence": "Not available",
+        }
+    except (OSError, ValueError, RuntimeError, urllib.error.URLError) as error:
         return {
             "disease": "Vision analysis failed",
             "treatment": "Check your OPENAI_API_KEY and internet connection, then try again. Do not apply chemicals based on an unverified diagnosis.",
