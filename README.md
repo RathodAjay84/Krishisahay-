@@ -1,3 +1,5 @@
+Updated project version 🚀
+
 # KrishiSahay
 
 KrishiSahay is a Streamlit smart agriculture assistant for Telangana farmers.
